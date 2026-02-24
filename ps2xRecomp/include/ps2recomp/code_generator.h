@@ -42,11 +42,13 @@ namespace ps2recomp
         std::string generateFunction(const Function &function, const std::vector<Instruction> &instructions, const bool &useHeaders);
         std::string generateFunctionRegistration(const std::vector<Function> &functions, const std::map<uint32_t, std::string> &stubs);
         std::string handleBranchDelaySlots(const Instruction &branchInst, const Instruction &delaySlot,
-                                           const Function &function, const AnalysisResult &analysisResult);
+                                           const Function &function, const AnalysisResult &analysisResult,
+                                           bool useSharedJrDispatch, bool useSharedJalrDispatch);
 
         void setRenamedFunctions(const std::unordered_map<uint32_t, std::string> &renames);
         void setBootstrapInfo(const BootstrapInfo &info);
         void setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames);
+        void setMaxInternalDispatchTargets(size_t maxTargets);
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
                                                   const std::vector<Instruction> &instructions);
@@ -57,6 +59,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> m_relocationCallNames;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
+        size_t m_maxInternalDispatchTargets = 4096;
 
         std::string translateInstruction(const Instruction &inst);
         std::string translateMMIInstruction(const Instruction &inst);

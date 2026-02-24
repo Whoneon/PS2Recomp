@@ -15,6 +15,9 @@
 
 namespace ps2recomp
 {
+    namespace {
+        constexpr size_t kDefaultMaxInternalDispatchTargets = 4096;
+    }
     const std::unordered_set<std::string> kKeywords = {
         "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool",
         "break", "case", "catch", "char", "char8_t", "char16_t", "char32_t", "class",
@@ -166,7 +169,9 @@ namespace ps2recomp
         const Instruction &branchInst,
         const Instruction &delaySlot,
         const Function &function,
-        const AnalysisResult &analysisResult)
+        const AnalysisResult &analysisResult,
+        bool useSharedJrDispatch,
+        bool useSharedJalrDispatch)
     {
         const std::unordered_set<uint32_t> &internalTargets = analysisResult.entryPoints;
         std::stringstream ss;
@@ -199,9 +204,11 @@ namespace ps2recomp
         const uint32_t fallthroughPc = branchInst.address + 8u;
 
         std::vector<uint32_t> sortedInternalTargets;
-        if (branchInst.opcode == OPCODE_SPECIAL &&
-            (branchInst.function == SPECIAL_JR || branchInst.function == SPECIAL_JALR) &&
-            !internalTargets.empty())
+        const bool isRegisterJump = (branchInst.opcode == OPCODE_SPECIAL &&
+                                     (branchInst.function == SPECIAL_JR || branchInst.function == SPECIAL_JALR));
+        const bool useSharedDispatch = (branchInst.function == SPECIAL_JR ? useSharedJrDispatch : useSharedJalrDispatch);
+        if (isRegisterJump && !useSharedDispatch && !internalTargets.empty() &&
+            internalTargets.size() <= m_maxInternalDispatchTargets)
         {
             auto jtIt = analysisResult.jumpTableTargets.find(branchInst.address);
             if (jtIt != analysisResult.jumpTableTargets.end()) {
@@ -378,30 +385,57 @@ namespace ps2recomp
 
             ss << "        ctx->pc = jumpTarget;\n";
 
-            if (!sortedInternalTargets.empty())
+            if (useSharedDispatch)
             {
-                ss << "        switch (jumpTarget) {\n";
-                for (uint32_t t : sortedInternalTargets)
+                if (branchInst.function == SPECIAL_JR)
                 {
-                    ss << fmt::format("            case 0x{:X}u: goto label_{:x};\n", t, t);
+                    ss << "        goto label_dispatch_internal_jr;\n";
                 }
-                ss << "            default: break;\n";
-                ss << "        }\n";
-            }
-
-            if (branchInst.function == SPECIAL_JR)
-            {
-                ss << "        return;\n";
+                else
+                {
+                    ss << fmt::format("        jalr_fallthrough_pc = 0x{:X}u;\n", fallthroughPc);
+                    ss << "        goto label_dispatch_internal_jalr;\n";
+                }
             }
             else
             {
-                ss << "        {\n";
-                ss << "            auto targetFn = runtime->lookupFunction(jumpTarget);\n";
-                ss << "            const uint32_t __entryPc = ctx->pc;\n";
-                ss << "            targetFn(rdram, ctx, runtime);\n";
-                ss << fmt::format("            if (ctx->pc == __entryPc) {{ ctx->pc = 0x{:X}u; }}\n", fallthroughPc);
-                ss << fmt::format("            if (ctx->pc != 0x{:X}u) {{ return; }}\n", fallthroughPc);
-                ss << "        }\n";
+                if (!sortedInternalTargets.empty())
+                {
+                    ss << "        switch (jumpTarget) {\n";
+                    for (uint32_t t : sortedInternalTargets)
+                    {
+                        ss << fmt::format("            case 0x{:X}u: goto label_{:x};\n", t, t);
+                    }
+                    ss << "            default: break;\n";
+                    ss << "        }\n";
+                }
+
+                if (branchInst.function == SPECIAL_JR)
+                {
+                    if (!sortedInternalTargets.empty())
+                    {
+                        ss << "        return;\n";
+                    }
+                    else
+                    {
+                        ss << "        {\n";
+                        ss << "            auto targetFn = runtime->lookupFunction(jumpTarget);\n";
+                        ss << "            const uint32_t __entryPc = ctx->pc;\n";
+                        ss << "            targetFn(rdram, ctx, runtime);\n";
+                        ss << "        }\n";
+                        ss << "        return;\n";
+                    }
+                }
+                else
+                {
+                    ss << "        {\n";
+                    ss << "            auto targetFn = runtime->lookupFunction(jumpTarget);\n";
+                    ss << "            const uint32_t __entryPc = ctx->pc;\n";
+                    ss << "            targetFn(rdram, ctx, runtime);\n";
+                    ss << fmt::format("            if (ctx->pc == __entryPc) {{ ctx->pc = 0x{:X}u; }}\n", fallthroughPc);
+                    ss << fmt::format("            if (ctx->pc != 0x{:X}u) {{ return; }}\n", fallthroughPc);
+                    ss << "        }\n";
+                }
             }
 
             ss << "    }\n";
@@ -599,6 +633,11 @@ namespace ps2recomp
 
     CodeGenerator::~CodeGenerator() = default;
 
+    void CodeGenerator::setMaxInternalDispatchTargets(size_t maxTargets)
+    {
+        m_maxInternalDispatchTargets = maxTargets;
+    }
+
     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(
         const Function &function, const std::vector<Instruction> &instructions)
     {
@@ -793,11 +832,13 @@ namespace ps2recomp
             }
 
             if (hasFallback) {
-                for (uint32_t addr : instructionAddresses)
-                {
-                    if (addr >= function.start && addr < function.end)
+                if (instructionAddresses.size() <= m_maxInternalDispatchTargets) {
+                    for (uint32_t addr : instructionAddresses)
                     {
-                        result.entryPoints.insert(addr);
+                        if (addr >= function.start && addr < function.end)
+                        {
+                            result.entryPoints.insert(addr);
+                        }
                     }
                 }
             }
@@ -825,6 +866,41 @@ namespace ps2recomp
 
         AnalysisResult analysisResult = collectInternalBranchTargets(function, instructions);
         const std::unordered_set<uint32_t>& internalTargets = analysisResult.entryPoints;
+        bool hasJr = false;
+        bool hasJalr = false;
+        for (const auto &inst : instructions)
+        {
+            if (inst.opcode == OPCODE_SPECIAL && inst.function == SPECIAL_JR)
+            {
+                hasJr = true;
+            }
+            else if (inst.opcode == OPCODE_SPECIAL && inst.function == SPECIAL_JALR)
+            {
+                hasJalr = true;
+            }
+            if (hasJr && hasJalr)
+            {
+                break;
+            }
+        }
+        if (m_maxInternalDispatchTargets == 0)
+        {
+            m_maxInternalDispatchTargets = kDefaultMaxInternalDispatchTargets;
+        }
+        const bool useSharedJrDispatch = hasJr && !internalTargets.empty() &&
+                                         internalTargets.size() <= m_maxInternalDispatchTargets;
+        const bool useSharedJalrDispatch = hasJalr && !internalTargets.empty() &&
+                                           internalTargets.size() <= m_maxInternalDispatchTargets;
+        std::vector<uint32_t> sortedInternalTargets;
+        if ((useSharedJrDispatch || useSharedJalrDispatch) && !internalTargets.empty())
+        {
+            sortedInternalTargets.reserve(internalTargets.size());
+            for (uint32_t t : internalTargets)
+            {
+                sortedInternalTargets.push_back(t);
+            }
+            std::sort(sortedInternalTargets.begin(), sortedInternalTargets.end());
+        }
         ss << "// Function: " << function.name << "\n";
         ss << "// Address: 0x" << std::hex << function.start << " - 0x" << function.end << std::dec << "\n";
 
@@ -840,6 +916,10 @@ namespace ps2recomp
         ss << "    ctx->pc = 0x" << std::hex << function.start << "u;\n"
            << std::dec;
         ss << "\n";
+        if (useSharedJalrDispatch)
+        {
+            ss << "    uint32_t jalr_fallthrough_pc = 0;\n\n";
+        }
 
         for (size_t i = 0; i < instructions.size(); ++i)
         {
@@ -867,7 +947,8 @@ namespace ps2recomp
                         ss << "label_" << std::hex << delaySlot.address << std::dec << ":\n";
                     }
 
-                    ss << handleBranchDelaySlots(inst, delaySlot, function, analysisResult);
+                    ss << handleBranchDelaySlots(inst, delaySlot, function, analysisResult,
+                                                 useSharedJrDispatch, useSharedJalrDispatch);
 
                     ++i; // Skip delay slot instruction (handled inside branch logic)
                 }
@@ -895,6 +976,39 @@ namespace ps2recomp
 
                 throw;
             }
+        }
+
+        if (useSharedJrDispatch)
+        {
+            ss << "label_dispatch_internal_jr:\n";
+            ss << "    switch (ctx->pc) {\n";
+            for (uint32_t t : sortedInternalTargets)
+            {
+                ss << fmt::format("        case 0x{:X}u: goto label_{:x};\n", t, t);
+            }
+            ss << "        default: break;\n";
+            ss << "    }\n";
+            ss << "    return;\n";
+        }
+
+        if (useSharedJalrDispatch)
+        {
+            ss << "label_dispatch_internal_jalr:\n";
+            ss << "    switch (ctx->pc) {\n";
+            for (uint32_t t : sortedInternalTargets)
+            {
+                ss << fmt::format("        case 0x{:X}u: goto label_{:x};\n", t, t);
+            }
+            ss << "        default: break;\n";
+            ss << "    }\n";
+            ss << "    {\n";
+            ss << "        auto targetFn = runtime->lookupFunction(ctx->pc);\n";
+            ss << "        const uint32_t __entryPc = ctx->pc;\n";
+            ss << "        targetFn(rdram, ctx, runtime);\n";
+            ss << "        if (ctx->pc == __entryPc) { ctx->pc = jalr_fallthrough_pc; }\n";
+            ss << "        if (ctx->pc != jalr_fallthrough_pc) { return; }\n";
+            ss << "    }\n";
+            ss << "    return;\n";
         }
 
         ss << "}\n";

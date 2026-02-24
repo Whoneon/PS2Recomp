@@ -32,6 +32,16 @@ namespace ps2recomp
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
+            const int64_t maxDispatch = toml::find_or<int64_t>(general, "max_internal_dispatch_targets",
+                                                              static_cast<int64_t>(config.maxInternalDispatchTargets));
+            if (maxDispatch > 0)
+            {
+                config.maxInternalDispatchTargets = static_cast<size_t>(maxDispatch);
+            }
+            else
+            {
+                config.maxInternalDispatchTargets = 0;
+            }
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
@@ -134,6 +144,7 @@ namespace ps2recomp
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
+        general["max_internal_dispatch_targets"] = static_cast<int64_t>(config.maxInternalDispatchTargets);
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         data["general"] = general;

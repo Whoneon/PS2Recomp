@@ -817,6 +817,7 @@ namespace ps2recomp
 
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
+            m_codeGenerator->setMaxInternalDispatchTargets(m_config.maxInternalDispatchTargets);
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
             for (const auto &reloc : m_relocations)
